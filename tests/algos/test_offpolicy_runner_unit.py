@@ -33,7 +33,12 @@ from uni_rl.offpolicy.runner import (
     replay_buffer_ready_for_learning,
     update_reward_stats_from_replay,
 )
-from uni_rl.utils.tensor_runtime import TensorRuntimeSettings
+from uni_rl.utils.tensor_runtime import (
+    InferencePlacement,
+    InferenceTransport,
+    TensorRuntimeSettings,
+    resolve_inference_placement,
+)
 
 
 @pytest.mark.parametrize(
@@ -410,7 +415,7 @@ def _make_device_runner(
     sim_backend: str = "mujoco",
     env_name: str = "DummyEnv",
     algo_type: str = "sac",
-    collector_tensor_native: bool = False,
+    collector_tensor_native: bool | None = None,
     inference_slot_capacity: int = 1,
     inference_epoch: int = 0,
     collector_metrics_interval: int = 1,
@@ -423,6 +428,13 @@ def _make_device_runner(
         device_runner_module, "require_offpolicy_replay_device", lambda value: value
     )
     monkeypatch.setattr(runner_module, "get_env_dims", lambda *args, **kwargs: (4, 2, 5))
+    placement = None
+    if collector_tensor_native is not None:
+        placement = resolve_inference_placement(
+            learner_device=device,
+            tensor_runtime=collector_tensor_native,
+            algo_name="TestRunner",
+        )
     return device_runner_module.DoubleBufferOffPolicyRunner(
         learner=learner or _Learner(),
         env_name=env_name,
@@ -437,7 +449,7 @@ def _make_device_runner(
         env_steps_per_sync=1,
         device=device,
         sim_backend=sim_backend,
-        collector_tensor_native=collector_tensor_native,
+        inference_placement=placement,
         inference_slot_capacity=inference_slot_capacity,
         inference_epoch=inference_epoch,
         collector_metrics_interval=collector_metrics_interval,
@@ -1207,6 +1219,31 @@ def test_runner_collector_resources_follow_tensor_runtime_capability(
     assert tensor_budget["replay_ingress_slot_rows"] == 1
     assert manifest["collector_metrics_interval"] == 1
     assert manifest["runtime_limits"]["replay_ingress_slot_rows"]["effective"] == 1
+    assert manifest["inference_ring_device"] == expected_device
+    assert manifest["env_public_device"] == expected_device
+    assert manifest["learner_device"] == "cuda"
+    assert manifest["inference_staging_policy"] == (
+        "cuda_no_host_boundary"
+        if collector_tensor_native
+        else "cpu_ring_explicit_learner_actor_h2d_action_d2h"
+    )
+    assert manifest["inference_transport"] == {
+        "mode": "cuda" if collector_tensor_native else "cpu",
+        "env_device": expected_device,
+        "ring_device": expected_device,
+        "learner_device": "cuda",
+        "staging_policy": (
+            "cuda_no_host_boundary"
+            if collector_tensor_native
+            else "cpu_ring_explicit_learner_actor_h2d_action_d2h"
+        ),
+    }
+    env_override = collector_kwargs["env_cfg_override"]
+    if collector_tensor_native:
+        assert env_override["tensor_runtime"] is True
+        assert env_override["tensor_runtime_device"] == "cuda"
+    else:
+        assert env_override is None or "tensor_runtime" not in env_override
     assert collector_kwargs["inference_epoch"] == 0
     assert collector_kwargs["collector_metrics_interval"] == 1
 
@@ -1214,7 +1251,9 @@ def test_runner_collector_resources_follow_tensor_runtime_capability(
 def test_runner_rejects_tensor_native_collector_without_cuda(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with pytest.raises(ValueError, match="collector_tensor_native=True requires a CUDA"):
+    with pytest.raises(
+        ValueError, match="CUDA inference transport requires CUDA env and learner devices"
+    ):
         _make_device_runner(
             monkeypatch,
             device="cpu",
@@ -1803,6 +1842,14 @@ def test_learner_inference_matches_existing_actor_exploration(algo_type: str) ->
     runner.algo_type = algo_type
     runner.learner = SimpleNamespace(actor=actor)
     runner.inference_epoch = 0
+    runner.inference_placement = InferencePlacement(
+        mode=InferenceTransport.CPU,
+        env_device="cpu",
+        ring_device="cpu",
+        learner_device="cpu",
+        collector_tensor_native=False,
+        staging_policy="cpu_no_device_transfer",
+    )
     slot = SharedInferenceRing(2, 3, 2)
     slot.publish_observation(tick_id=0, observations=observations, dones=dones, epoch=0)
     torch.manual_seed(17)
@@ -1812,6 +1859,9 @@ def test_learner_inference_matches_existing_actor_exploration(algo_type: str) ->
         policy_version=9,
         obs_device=torch.empty(2, 3),
         dones_device=torch.empty(2),
+        actor_obs_device=torch.empty(2, 3),
+        actor_dones_device=torch.empty(2),
+        actions_host=torch.empty(2, 2),
         trace_recorder=None,
     )
     actual, policy_version = slot.consume_action(tick_id=0, epoch=0)
@@ -1865,6 +1915,14 @@ def test_adapter_learner_inference_uses_actor_context(
     runner.algo_type = "dummy_priv_sac"
     runner.learner = SimpleNamespace(actor=actor)
     runner.inference_epoch = 0
+    runner.inference_placement = InferencePlacement(
+        mode=InferenceTransport.CPU,
+        env_device="cpu",
+        ring_device="cpu",
+        learner_device="cpu",
+        collector_tensor_native=False,
+        staging_policy="cpu_no_device_transfer",
+    )
     slot = SharedInferenceRing(2, 5, 2)
     slot.publish_observation(tick_id=0, observations=actor_input, dones=dones, epoch=0)
     runner._serve_learner_inference(
@@ -1873,6 +1931,9 @@ def test_adapter_learner_inference_uses_actor_context(
         policy_version=10,
         obs_device=torch.empty(2, 5),
         dones_device=torch.empty(2),
+        actor_obs_device=torch.empty(2, 5),
+        actor_dones_device=torch.empty(2),
+        actions_host=torch.empty(2, 2),
         trace_recorder=None,
     )
     actual, policy_version = slot.consume_action(tick_id=0, epoch=0)

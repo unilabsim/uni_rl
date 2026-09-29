@@ -166,7 +166,8 @@ def test_sac_builder_forwards_backend_device_binder(
 
     assert runner.kwargs["backend_device_binder"] is (_binder if with_binder else None)
     assert runner.kwargs["log_interval"] == 3
-    assert runner.kwargs["collector_tensor_native"] is False
+    assert runner.kwargs["inference_placement"].collector_tensor_native is False
+    assert runner.kwargs["inference_placement"].mode.value == "cpu"
     settings = runner.kwargs["tensor_runtime_settings"]
     assert settings.inference_slot_capacity == 1
     assert settings.collector_metrics_interval == 1
@@ -205,7 +206,8 @@ def test_flashsac_builder_forwards_backend_device_binder(
 
     assert runner.kwargs["backend_device_binder"] is (_binder if with_binder else None)
     assert runner.kwargs["log_interval"] == 3
-    assert runner.kwargs["collector_tensor_native"] is False
+    assert runner.kwargs["inference_placement"].collector_tensor_native is False
+    assert runner.kwargs["inference_placement"].mode.value == "cpu"
     settings = runner.kwargs["tensor_runtime_settings"]
     assert settings.inference_slot_capacity == 1
     assert settings.collector_metrics_interval == 1
@@ -320,7 +322,8 @@ def test_flashsac_builder_resolves_tensor_runtime_before_collector_spawn(
         replay_prefetch_mode="one_tick",
         device="cpu",
     )
-    assert runner.kwargs["collector_tensor_native"] is False
+    assert runner.kwargs["inference_placement"].collector_tensor_native is False
+    assert runner.kwargs["inference_placement"].mode.value == "cpu"
 
 
 def test_sac_builder_resolves_tensor_runtime_before_collector_spawn(
@@ -341,7 +344,8 @@ def test_sac_builder_resolves_tensor_runtime_before_collector_spawn(
         device="cpu",
     )
 
-    assert runner.kwargs["collector_tensor_native"] is False
+    assert runner.kwargs["inference_placement"].collector_tensor_native is False
+    assert runner.kwargs["inference_placement"].mode.value == "cpu"
 
 
 def test_sac_builder_rejects_tensor_runtime_on_cpu(
@@ -354,7 +358,9 @@ def test_sac_builder_rejects_tensor_runtime_on_cpu(
     cfg = _sac_cfg()
     cfg.env = {"tensor_runtime": True}
 
-    with pytest.raises(ValueError, match="FastSAC env.tensor_runtime=true requires CUDA"):
+    with pytest.raises(
+        ValueError, match="FastSAC CUDA inference transport requires CUDA env and learner devices"
+    ):
         module.build_sac_double_buffer_runner(
             cfg,
             env_factory=_fake_env_factory,
@@ -373,7 +379,9 @@ def test_flashsac_builder_rejects_tensor_runtime_on_cpu(
     cfg = _flashsac_cfg()
     cfg.env = {"tensor_runtime": True}
 
-    with pytest.raises(ValueError, match="env.tensor_runtime=true requires CUDA"):
+    with pytest.raises(
+        ValueError, match="CUDA inference transport requires CUDA env and learner devices"
+    ):
         module.build_flashsac_double_buffer_runner(
             cfg,
             env_factory=_fake_env_factory,

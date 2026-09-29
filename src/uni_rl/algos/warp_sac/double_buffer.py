@@ -19,6 +19,8 @@ from uni_rl.utils.nan_guard import NanGuardCfg
 from uni_rl.utils.observations import get_obs_dims
 from uni_rl.utils.seed import apply_training_seed
 from uni_rl.utils.tensor_runtime import (
+    InferencePlacement,
+    resolve_inference_transport,
     resolve_tensor_runtime_settings,
 )
 
@@ -57,6 +59,7 @@ def build_warpsac_double_buffer_runner(
     if replay_prefetch_mode != "one_tick":
         raise ValueError("WarpSAC device replay requires replay_prefetch_mode='one_tick'")
     _validate_warpsac_runtime(cfg)
+    inference_placement = resolve_inference_transport(cfg, device=device, algo_name="WarpSAC")
     tensor_runtime_settings = resolve_tensor_runtime_settings(
         cfg,
         algo_name="WarpSAC",
@@ -147,6 +150,7 @@ def build_warpsac_double_buffer_runner(
         collector_cpu_ids=collector_cpu_ids,
         dp_sync=dp_sync,
         backend_device_binder=backend_device_binder,
+        inference_placement=inference_placement,
         tensor_runtime_settings=tensor_runtime_settings,
         log_interval=int(cfg.training.log_interval),
         replay_pipeline_factory=partial(

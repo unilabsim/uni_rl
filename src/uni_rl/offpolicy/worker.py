@@ -233,6 +233,7 @@ def off_policy_collector_fn(
     algo_type: str = "sac",
     actor_adapter_modules: list[str] | tuple[str, ...] | None = None,
     metrics_queue=None,
+    inference_transport: str = "cpu",
     inference_epoch: int = 0,
     collector_metrics_interval: int = 1,
     sim_backend: str = "mujoco",
@@ -263,6 +264,7 @@ def off_policy_collector_fn(
         algo_type=algo_type,
         actor_adapter_modules=actor_adapter_modules,
         metrics_queue=metrics_queue,
+        inference_transport=inference_transport,
         inference_epoch=inference_epoch,
         collector_metrics_interval=collector_metrics_interval,
         sim_backend=sim_backend,
@@ -290,6 +292,7 @@ def _run_collector(
     algo_type,
     actor_adapter_modules,
     metrics_queue,
+    inference_transport,
     sim_backend,
     backend_device,
     env_cfg_override,
@@ -322,6 +325,31 @@ def _run_collector(
     # Initialize environment through the injected factory (see
     # ``uni_rl.env_contract``); uni_rl never touches an env registry.
     env = env_factory(num_envs, env_cfg_override)
+    requested_transport = inference_transport
+    if requested_transport not in {"cpu", "cuda", "legacy_tensor"}:
+        raise ValueError(
+            "Collector inference transport must be 'cpu', 'cuda', or the internal "
+            f"'legacy_tensor' compatibility marker, got {requested_transport!r}"
+        )
+    if "inference_transport" in (env_cfg_override or {}):
+        raise ValueError("Collector env override must not set inference_transport")
+    tensor_runtime_requested = bool((env_cfg_override or {}).get("tensor_runtime", False))
+    if tensor_runtime_requested:
+        public_device = (env_cfg_override or {}).get("tensor_runtime_device")
+        if not isinstance(public_device, str) or not public_device.strip():
+            raise ValueError(
+                "tensor_runtime collector env override must include tensor_runtime_device"
+            )
+        if torch.device(public_device).type != "cuda":
+            raise ValueError(
+                f"tensor_runtime collector env override must request CUDA; got {public_device!r}"
+            )
+        if inference_slot is None or inference_slot.device != torch.device(public_device):
+            ring_device = getattr(inference_slot, "device", None)
+            raise ValueError(
+                "CUDA collector inference ring and env public device differ: "
+                f"ring={ring_device}, env={public_device}"
+            )
     if nan_guard_cfg is not None and nan_guard_cfg.enabled:
         from uni_rl.utils.nan_guard import NanGuard
 
@@ -348,6 +376,31 @@ def _run_collector(
     state = env.state
     assert state is not None
     tensor_collector = isinstance(state.obs.get("obs"), torch.Tensor)
+    actor_observation = state.obs.get("obs")
+    observed_env_device = (
+        actor_observation.device
+        if isinstance(actor_observation, torch.Tensor)
+        else torch.device("cpu")
+    )
+    inference_ring_device = (
+        inference_slot.device if inference_slot is not None else torch.device("cpu")
+    )
+    if tensor_runtime_requested:
+        if not tensor_collector:
+            raise ValueError(
+                "CUDA inference transport requires tensor observations from the "
+                f"environment; env={observed_env_device}, ring={inference_ring_device}"
+            )
+        if observed_env_device != inference_ring_device:
+            raise ValueError(
+                "CUDA inference transport requires env observations on the ring device: "
+                f"env={observed_env_device}, ring={inference_ring_device}"
+            )
+    elif requested_transport == "cpu" and tensor_collector and observed_env_device.type == "cuda":
+        raise ValueError(
+            "CPU inference transport received CUDA tensor observations from the "
+            f"environment; env={observed_env_device}, ring={inference_ring_device}"
+        )
     current_ep_rewards = np.zeros(num_envs, dtype=np.float32)
     current_ep_lengths = np.zeros(num_envs, dtype=np.int32)
     tensor_metrics = (
@@ -503,6 +556,7 @@ def _run_collector(
         except Exception as exc:
             print(f"[OffPolicyWorker] final tensor metric flush error: {exc}", file=sys.stderr)
 
+    action_host: torch.Tensor | None = None
     obs_t: torch.Tensor | None = None
     critic_t: torch.Tensor | None = None
     obs_np: np.ndarray | None = None
@@ -691,6 +745,17 @@ def _run_collector(
 
             # Step environment
             _env_ns = _time.perf_counter_ns()
+            # TorchEnv has a tensor-only public action contract even when the
+            # inference ring is CPU. Reuse one persistent host staging tensor
+            # for this explicit ring->env boundary rather than allocating or
+            # silently converting inside the env.
+            if tensor_collector and isinstance(actions, np.ndarray):
+                if action_host is None:
+                    action_host = torch.empty(
+                        actions.shape, dtype=torch.float32, device=torch.device("cpu")
+                    )
+                action_host.copy_(torch.from_numpy(np.ascontiguousarray(actions, dtype=np.float32)))
+                actions = action_host
             state = env.step(actions if tensor_collector else actions_np)
             if trace_recorder:
                 trace_recorder.add_slice(

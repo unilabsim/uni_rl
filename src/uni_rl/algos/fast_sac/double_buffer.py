@@ -16,7 +16,8 @@ from uni_rl.offpolicy.runtime import resolve_actor_adapter_modules, resolve_cust
 from uni_rl.utils.nan_guard import NanGuardCfg
 from uni_rl.utils.observations import get_obs_dims
 from uni_rl.utils.tensor_runtime import (
-    resolve_collector_tensor_native,
+    InferencePlacement,
+    resolve_inference_transport,
     resolve_tensor_runtime_settings,
 )
 
@@ -45,9 +46,7 @@ def build_sac_double_buffer_runner(
     # forwards the list to the spawn collector.
     actor_adapter_modules = resolve_actor_adapter_modules(rl_cfg, custom_runtime)
     import_actor_adapter_modules(actor_adapter_modules)
-    collector_tensor_native = resolve_collector_tensor_native(
-        cfg, device=device, algo_name="FastSAC"
-    )
+    inference_placement = resolve_inference_transport(cfg, device=device, algo_name="FastSAC")
     tensor_runtime_settings = resolve_tensor_runtime_settings(
         cfg,
         algo_name="FastSAC",
@@ -142,7 +141,7 @@ def build_sac_double_buffer_runner(
         ),
         backend_device_binder=backend_device_binder,
         actor_adapter_modules=actor_adapter_modules,
-        collector_tensor_native=collector_tensor_native,
+        inference_placement=inference_placement,
         tensor_runtime_settings=tensor_runtime_settings,
         log_interval=int(cfg.training.log_interval),
     )

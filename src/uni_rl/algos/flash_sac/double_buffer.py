@@ -17,7 +17,8 @@ from uni_rl.utils.nan_guard import NanGuardCfg
 from uni_rl.utils.observations import get_obs_dims
 from uni_rl.utils.seed import apply_training_seed
 from uni_rl.utils.tensor_runtime import (
-    resolve_collector_tensor_native,
+    InferencePlacement,
+    resolve_inference_transport,
     resolve_tensor_runtime_settings,
 )
 
@@ -56,9 +57,7 @@ def build_flashsac_double_buffer_runner(
         cfg,
         replay_prefetch_mode=replay_prefetch_mode,
     )
-    collector_tensor_native = resolve_collector_tensor_native(
-        cfg, device=device, algo_name="FlashSAC"
-    )
+    inference_placement = resolve_inference_transport(cfg, device=device, algo_name="FlashSAC")
     tensor_runtime_settings = resolve_tensor_runtime_settings(
         cfg,
         algo_name="FlashSAC",
@@ -147,7 +146,7 @@ def build_flashsac_double_buffer_runner(
         collector_cpu_ids=collector_cpu_ids,
         dp_sync=dp_sync,
         backend_device_binder=backend_device_binder,
-        collector_tensor_native=collector_tensor_native,
+        inference_placement=inference_placement,
         tensor_runtime_settings=tensor_runtime_settings,
         log_interval=int(cfg.training.log_interval),
     )

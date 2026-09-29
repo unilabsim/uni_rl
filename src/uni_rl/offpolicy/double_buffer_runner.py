@@ -64,6 +64,8 @@ from uni_rl.utils.tensor_runtime import (
     DEFAULT_COLLECTOR_METRICS_INTERVAL,
     DEFAULT_INFERENCE_SLOT_CAPACITY,
     DEFAULT_REPLAY_INGRESS_DEPTH,
+    InferencePlacement,
+    InferenceTransport,
     TensorRuntimeSettings,
 )
 
@@ -187,7 +189,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         replay_pipeline_factory: Callable[..., GPUResidentReplayPipeline] | None = None,
         target_frequency: int = 1,
         policy_before_critic: bool = False,
-        collector_tensor_native: bool = False,
+        inference_placement: InferencePlacement | None = None,
+        collector_tensor_native: bool | None = None,
         tensor_runtime_settings: TensorRuntimeSettings | None = None,
         inference_slot_capacity: int | None = None,
         inference_epoch: int = 0,
@@ -287,16 +290,63 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         # merged into the collector-only env override at collector startup.
         self.collector_cpu_ids = list(collector_cpu_ids) if collector_cpu_ids is not None else None
         self.collector_backend_device = collector_backend_device
-        if not isinstance(collector_tensor_native, bool):
+        if isinstance(collector_tensor_native, bool) and inference_placement is None:
+            inference_placement = InferencePlacement(
+                mode=(
+                    InferenceTransport.CUDA if collector_tensor_native else InferenceTransport.CPU
+                ),
+                env_device=(
+                    str(kwargs["device"])
+                    if collector_tensor_native
+                    and torch.device(str(kwargs["device"])).type == "cuda"
+                    else "cpu"
+                ),
+                ring_device=(
+                    str(kwargs["device"])
+                    if collector_tensor_native
+                    and torch.device(str(kwargs["device"])).type == "cuda"
+                    else "cpu"
+                ),
+                learner_device=str(kwargs["device"]),
+                collector_tensor_native=collector_tensor_native,
+                staging_policy=(
+                    "cuda_no_host_boundary"
+                    if collector_tensor_native
+                    else (
+                        "cpu_ring_explicit_learner_actor_h2d_action_d2h"
+                        if torch.device(str(kwargs["device"])).type == "cuda"
+                        else "cpu_no_device_transfer"
+                    )
+                ),
+            )
+            warnings.warn(
+                "collector_tensor_native is deprecated; construct DoubleBufferOffPolicyRunner "
+                "with resolve_inference_transport()'s inference_placement",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if inference_placement is None:
+            inference_placement = InferencePlacement(
+                mode=InferenceTransport.CPU,
+                env_device="cpu",
+                ring_device="cpu",
+                learner_device=str(kwargs["device"]),
+                collector_tensor_native=False,
+                staging_policy=(
+                    "cpu_ring_explicit_learner_actor_h2d_action_d2h"
+                    if torch.device(str(kwargs["device"])).type == "cuda"
+                    else "cpu_no_device_transfer"
+                ),
+            )
+        if not isinstance(inference_placement, InferencePlacement):
             raise TypeError(
-                f"collector_tensor_native must be a boolean, got {collector_tensor_native!r}"
+                f"inference_placement must be an InferencePlacement, got {inference_placement!r}"
             )
-        if collector_tensor_native and torch.device(str(kwargs["device"])).type != "cuda":
-            raise ValueError(
-                "collector_tensor_native=True requires a CUDA replay device; "
-                f"got {kwargs['device']!r}"
-            )
-        self.collector_tensor_native = collector_tensor_native
+        self._validate_inference_placement(
+            inference_placement, learner_device=str(kwargs["device"])
+        )
+        self.inference_placement = inference_placement
+        self.collector_tensor_native = inference_placement.collector_tensor_native
         self.tensor_runtime_settings = tensor_runtime_settings
         self.inference_slot_capacity = tensor_runtime_settings.inference_slot_capacity
         if isinstance(inference_epoch, bool) or not isinstance(inference_epoch, int):
@@ -334,6 +384,11 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "collector_backend_device": self.collector_backend_device,
             "collector_torch_inference": False,
             "collector_tensor_native": self.collector_tensor_native,
+            "inference_transport": self.inference_placement.manifest(),
+            "inference_ring_device": self.inference_placement.ring_device,
+            "env_public_device": self.inference_placement.env_device,
+            "learner_device": self.inference_placement.learner_device,
+            "inference_staging_policy": self.inference_placement.staging_policy,
             "inference_ring_capacity": self.inference_slot_capacity,
             "runtime_limits": self.tensor_runtime_settings.manifest(),
             "inference_flight": {
@@ -355,6 +410,48 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 "backend": self.dp_sync.backend,
                 "mode": "gradient_mean_per_optimizer_step",
             }
+
+    def _validate_inference_placement(
+        self, placement: InferencePlacement, *, learner_device: str
+    ) -> None:
+        """Fail closed before collector spawn on an incoherent topology."""
+        expected_learner = str(learner_device)
+        if placement.learner_device != expected_learner:
+            raise ValueError(
+                "inference_placement learner device must match the runner device: "
+                f"{placement.learner_device!r} != {expected_learner!r}"
+            )
+        if placement.mode is InferenceTransport.CUDA:
+            ring = torch.device(placement.ring_device)
+            env = torch.device(placement.env_device)
+            learner = torch.device(expected_learner)
+            if learner.type != "cuda":
+                raise ValueError(
+                    "CUDA inference transport requires a CUDA runner device; "
+                    f"got {expected_learner!r}"
+                )
+            if ring != learner or env != learner:
+                raise ValueError(
+                    "CUDA inference transport requires the env, inference ring, and "
+                    f"learner to share one rank-local CUDA device; got env={placement.env_device!r}, "
+                    f"ring={placement.ring_device!r}, learner={expected_learner!r}"
+                )
+            if not placement.collector_tensor_native:
+                raise ValueError("CUDA inference transport requires tensor-native collection")
+            return
+
+        if torch.device(placement.ring_device).type != "cpu":
+            raise ValueError(
+                "CPU inference transport requires a CPU inference ring; "
+                f"got {placement.ring_device!r}"
+            )
+        if placement.collector_tensor_native:
+            raise ValueError("CPU inference transport requires NumPy collector transitions")
+        if torch.device(placement.env_device).type != "cpu":
+            raise ValueError(
+                "CPU inference transport requires CPU env public tensors; "
+                f"got {placement.env_device!r}"
+            )
 
     def _attach_dp_gradient_sync(self) -> None:
         if self.dp_sync is None:
@@ -854,9 +951,23 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         the affinity list must only reach the collector's copy — never the
         learner-side probe envs, which keep the base override untouched.
         """
-        if self.collector_cpu_ids is None:
-            return self.env_cfg_override
-        return {**(self.env_cfg_override or {}), "cpu_ids": list(self.collector_cpu_ids)}
+        override = dict(self.env_cfg_override or {})
+        if self.collector_cpu_ids is not None:
+            override["cpu_ids"] = list(self.collector_cpu_ids)
+        # Keep the resolved env public-device request on the same rank-local
+        # CUDA device as the ring. Copying here avoids mutating the probe env's
+        # opaque owner mapping while still validating it before spawn.
+        if self.inference_placement.mode is InferenceTransport.CPU:
+            override.pop("tensor_runtime", None)
+            override.pop("tensor_runtime_device", None)
+            # This key is process-local transport metadata for the worker. It
+            # is injected below as an explicit collector-only argument rather
+            # than an EnvCfg field, which must remain owned by UniLab.
+            override.pop("inference_transport", None)
+        else:
+            override["tensor_runtime"] = True
+            override["tensor_runtime_device"] = self.inference_placement.env_device
+        return override or None
 
     def _wait_for_inference_request(
         self,
@@ -921,6 +1032,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         policy_version: int,
         obs_device: torch.Tensor,
         dones_device: torch.Tensor,
+        actor_obs_device: torch.Tensor,
+        actor_dones_device: torch.Tensor,
+        actions_host: torch.Tensor | None,
         trace_recorder: TraceRecorder | None,
     ) -> dict[str, float]:
         device = torch.device(self.device)
@@ -934,11 +1048,18 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         )
         h2d_end_ns = time.perf_counter_ns()
 
-        actor_obs = obs_device[:, : self.obs_dim]
+        # CPU transport owns exactly one persistent ring->actor H2D boundary.
+        if self.inference_placement.mode is InferenceTransport.CPU:
+            actor_obs_device.copy_(obs_device, non_blocking=False)
+            actor_dones_device.copy_(dones_device, non_blocking=False)
+        else:
+            if actor_obs_device is not obs_device or actor_dones_device is not dones_device:
+                raise RuntimeError("CUDA inference transport must reuse ring-device scratch")
+        actor_obs = actor_obs_device[:, : self.obs_dim]
         actor_adapter = get_offpolicy_actor_adapter(self.algo_type)
         actor_context = None
         if actor_adapter is not None and actor_adapter.actor_context_from_obs is not None:
-            actor_context = actor_adapter.actor_context_from_obs(obs_device, self.obs_dim)
+            actor_context = actor_adapter.actor_context_from_obs(actor_obs_device, self.obs_dim)
         if self.obs_normalization:
             actor_obs = self.learner.obs_normalizer(actor_obs, update=False)
         forward_start_ns = time.perf_counter_ns()
@@ -953,7 +1074,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 actor=self.learner.actor,
                 algo_type=self.algo_type,
                 obs_torch=actor_obs,
-                prev_dones_torch=dones_device,
+                prev_dones_torch=actor_dones_device,
                 priv_info_torch=actor_context,
             )
         if cuda_forward_events is not None:
@@ -966,10 +1087,18 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         forward_end_ns = time.perf_counter_ns()
 
         d2h_start_ns = time.perf_counter_ns()
+        # CPU transport owns exactly one actor->host action D2H boundary into a
+        # persistent tensor; CUDA actions remain on the ring device.
+        actions_for_ring = actions_device
+        if self.inference_placement.mode is InferenceTransport.CPU:
+            if actions_host is None:
+                raise RuntimeError("CPU inference transport lost its action staging tensor")
+            actions_host.copy_(actions_device, non_blocking=False)
+            actions_for_ring = actions_host
         inference_slot.publish_action(
             tick_id=tick_id,
             policy_version=policy_version,
-            actions=actions_device,
+            actions=actions_for_ring,
             non_blocking=False,
             epoch=self.inference_epoch,
         )
@@ -1229,6 +1358,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         )
 
         gpu_centric_collector = self.collector_tensor_native
+        inference_ring_device = self.inference_placement.ring_device
         actor_context_dim = int(getattr(self.learner, "priv_info_dim", 0))
         inference_input_dim = self.obs_dim + actor_context_dim
         inference_ring_bytes = estimate_inference_ring_bytes(
@@ -1317,6 +1447,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             ingress_slot_rows=self.replay_ingress_slot_rows,
             ingress_depth=self.replay_ingress_depth,
             ingress_device=self.device if gpu_centric_collector else "cpu",
+            # CPU transport still owns a CUDA replay device and CPU ingress.
         )
         self._active_replay_buffer = replay_buffer
         self._shared_resources.append(replay_buffer)
@@ -1368,7 +1499,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             self.num_envs,
             inference_input_dim,
             self.action_dim,
-            device=self.device if gpu_centric_collector else "cpu",
+            device=inference_ring_device,
             capacity=self.inference_slot_capacity,
             epoch=self.inference_epoch,
         )
@@ -1377,13 +1508,46 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         inference_obs_device = torch.empty(
             (self.num_envs, inference_input_dim),
             dtype=torch.float32,
-            device=self.device,
+            device=inference_ring_device,
         )
         inference_dones_device = torch.empty(
             self.num_envs,
             dtype=torch.float32,
-            device=self.device,
+            device=inference_ring_device,
         )
+        # CPU transport owns persistent learner-side actor staging. Copies into
+        # these tensors are its sole ring->actor H2D boundary; CUDA transport
+        # deliberately reuses the ring-device scratch with no host detour.
+        if self.inference_placement.mode is InferenceTransport.CPU:
+            inference_obs_actor = torch.empty(
+                inference_obs_device.shape,
+                dtype=inference_obs_device.dtype,
+                device=self.device,
+            )
+            inference_dones_actor = torch.empty(
+                inference_dones_device.shape,
+                dtype=inference_dones_device.dtype,
+                device=self.device,
+            )
+            inference_actions_host = torch.empty(
+                (self.num_envs, self.action_dim), dtype=torch.float32, device="cpu"
+            )
+            self.runtime_manifest.update(
+                {
+                    "inference_learner_scratch_device": self.inference_placement.learner_device,
+                    "inference_action_host_staging": True,
+                }
+            )
+        else:
+            inference_obs_actor = inference_obs_device
+            inference_dones_actor = inference_dones_device
+            inference_actions_host = None
+            self.runtime_manifest.update(
+                {
+                    "inference_learner_scratch_device": self.inference_placement.learner_device,
+                    "inference_action_host_staging": False,
+                }
+            )
         self.runtime_manifest.update(
             {
                 "inference_slot_bytes": inference_slot.nbytes,
@@ -1455,8 +1619,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             # tick 0. DP initialization remains first so warmup sees broadcast
             # parameters and can capture rank-aligned graphs.
             self._prepare_learner(
-                inference_observations=inference_obs_device,
-                inference_dones=inference_dones_device,
+                inference_observations=inference_obs_actor,
+                inference_dones=inference_dones_actor,
                 replay_pipeline=replay_pipeline,
             )
             self._shutdown_recorder.set_phase(owner="learner", phase="startup/collector_start")
@@ -1474,6 +1638,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 "sim_backend": self.sim_backend,
                 "backend_device": self.collector_backend_device,
                 "env_cfg_override": self._collector_env_cfg_override(),
+                "inference_transport": self.inference_placement.mode.value,
                 "inference_slot": inference_slot,
                 "inference_epoch": self.inference_epoch,
                 "collector_metrics_interval": self.collector_metrics_interval,
@@ -1572,6 +1737,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                         policy_version=inference_scheduler.policy_version,
                         obs_device=inference_obs_device,
                         dones_device=inference_dones_device,
+                        actor_obs_device=inference_obs_actor,
+                        actor_dones_device=inference_dones_actor,
+                        actions_host=inference_actions_host,
                         trace_recorder=trace_recorder,
                     )
                     self._shutdown_recorder.set_phase(

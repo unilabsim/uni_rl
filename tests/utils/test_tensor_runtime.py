@@ -14,10 +14,13 @@ from uni_rl.utils.tensor_runtime import (
     MAX_COLLECTOR_METRICS_INTERVAL,
     MAX_INFERENCE_SLOT_CAPACITY,
     MAX_REPLAY_INGRESS_DEPTH,
+    InferenceTransport,
     TensorRuntimeSettings,
     resolve_collector_metrics_interval,
     resolve_collector_tensor_native,
+    resolve_inference_placement,
     resolve_inference_slot_capacity,
+    resolve_inference_transport,
     resolve_tensor_runtime_settings,
 )
 
@@ -254,4 +257,117 @@ def test_direct_settings_object_rejects_inconsistent_configured_evidence() -> No
             batch_size=1,
             updates_per_step=1,
             num_envs=1,
+        )
+
+
+def test_default_owner_config_resolves_cpu_transport_with_explicit_cuda_learner() -> None:
+    placement = resolve_inference_transport(_cfg(), device="cuda:3", algo_name="SAC")
+
+    assert placement.mode is InferenceTransport.CPU
+    assert placement.env_device == "cpu"
+    assert placement.ring_device == "cpu"
+    assert placement.learner_device == "cuda:3"
+    assert placement.collector_tensor_native is False
+    assert placement.staging_policy == "cpu_ring_explicit_learner_actor_h2d_action_d2h"
+    assert placement.manifest() == {
+        "mode": "cpu",
+        "env_device": "cpu",
+        "ring_device": "cpu",
+        "learner_device": "cuda:3",
+        "staging_policy": "cpu_ring_explicit_learner_actor_h2d_action_d2h",
+    }
+
+
+def test_legacy_tensor_runtime_resolves_one_cuda_transport_device() -> None:
+    placement = resolve_inference_transport(
+        _cfg(env={"tensor_runtime": True}),
+        device="cuda:2",
+        algo_name="FlashSAC",
+    )
+
+    assert placement.mode is InferenceTransport.CUDA
+    assert placement.env_device == placement.ring_device == placement.learner_device
+    assert placement.env_device == "cuda:2"
+    assert placement.collector_tensor_native is True
+    assert placement.staging_policy == "cuda_no_host_boundary"
+
+
+def test_explicit_transport_can_request_cuda_without_legacy_boolean() -> None:
+    placement = resolve_inference_transport(
+        _cfg(
+            training={"inference_transport": "cuda"},
+            env={"tensor_runtime_device": "cuda:4"},
+        ),
+        device="cuda:4",
+        algo_name="WarpSAC",
+    )
+
+    assert placement.mode is InferenceTransport.CUDA
+    assert placement.env_device == "cuda:4"
+    assert placement.ring_device == "cuda:4"
+    assert placement.collector_tensor_native is True
+
+
+@pytest.mark.parametrize(
+    ("env", "learner_device", "match"),
+    [
+        (
+            {"tensor_runtime": True},
+            "cpu",
+            "CUDA inference transport requires CUDA env and learner devices",
+        ),
+        (
+            {"tensor_runtime": True, "tensor_runtime_device": "cuda:1"},
+            "cuda:0",
+            "CUDA inference transport requires rank-local devices to match",
+        ),
+        (
+            {"tensor_runtime": True},
+            "cpu",
+            "CUDA inference transport requires CUDA env and learner devices",
+        ),
+        (
+            {"tensor_runtime_device": "cuda:3"},
+            "cuda:0",
+            "CUDA inference transport requires rank-local devices to match",
+        ),
+    ],
+)
+def test_incoherent_cuda_requests_fail_before_collector_spawn(
+    env: dict, learner_device: str, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        resolve_inference_transport(_cfg(env=env), device=learner_device, algo_name="SAC")
+
+
+def test_cpu_transport_rejects_cuda_env_or_legacy_tensor_runtime() -> None:
+    with pytest.raises(
+        ValueError, match="requests CUDA env.tensor_runtime with CPU inference transport"
+    ):
+        resolve_inference_transport(
+            _cfg(
+                training={"inference_transport": "cpu"},
+                env={"tensor_runtime": True, "tensor_runtime_device": "cpu"},
+            ),
+            device="cuda:0",
+            algo_name="SAC",
+        )
+
+    with pytest.raises(
+        ValueError, match="requests CUDA env.tensor_runtime with CPU inference transport"
+    ):
+        resolve_inference_transport(
+            _cfg(training={"inference_transport": "cpu"}, env={"tensor_runtime_device": "cuda:0"}),
+            device="cuda:0",
+            algo_name="SAC",
+        )
+
+
+def test_inference_transport_request_must_be_named_device() -> None:
+    with pytest.raises(ValueError, match="inference transport must be one of"):
+        resolve_inference_placement(
+            learner_device="cuda:0",
+            transport="accel",
+            tensor_runtime=True,
+            algo_name="SAC",
         )

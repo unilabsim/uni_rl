@@ -400,6 +400,7 @@ def test_collector_publishes_ready_after_initialization(
         algo_type="sac",
         actor_adapter_modules=None,
         metrics_queue=metrics_queue,
+        inference_transport="legacy_tensor",
         sim_backend="mujoco",
         backend_device=None,
         env_cfg_override=None,
@@ -446,6 +447,7 @@ def test_collector_requires_batched_replay_publication(
             algo_type="sac",
             actor_adapter_modules=None,
             metrics_queue=queue.Queue(),
+            inference_transport="legacy_tensor",
             sim_backend="mujoco",
             backend_device=None,
             env_cfg_override=None,
@@ -487,6 +489,7 @@ def test_collector_binds_backend_device_before_env_materialization(
             algo_type="sac",
             actor_adapter_modules=None,
             metrics_queue=None,
+            inference_transport="cpu",
             sim_backend="mjwarp",
             backend_device="cuda:3",
             env_cfg_override=None,
@@ -613,6 +616,7 @@ def test_tensor_collector_reports_bounded_inference_scheduling_diagnostics(
         algo_type="sac",
         actor_adapter_modules=None,
         metrics_queue=metrics_queue,
+        inference_transport="legacy_tensor",
         sim_backend="mujoco",
         backend_device=None,
         env_cfg_override=None,
@@ -777,6 +781,7 @@ def test_worker_shutdown_flushes_partial_metrics_before_abnormal_cleanup(
             algo_type="sac",
             actor_adapter_modules=None,
             metrics_queue=metrics_queue,
+            inference_transport="legacy_tensor",
             sim_backend="mujoco",
             backend_device=None,
             env_cfg_override=None,
@@ -1103,3 +1108,95 @@ def test_resolve_offpolicy_actor_priv_info_returns_none_without_adapter() -> Non
     )
 
     assert resolved is None
+
+
+def test_collector_rejects_cuda_ring_without_tensor_runtime_override() -> None:
+    stop_event = threading.Event()
+    ring = SharedInferenceRing(1, 2, 2, device="cpu")
+
+    with pytest.raises(ValueError, match="Collector env override must not set inference_transport"):
+        worker_module._run_collector(
+            stop_event=stop_event,
+            env_factory=lambda num_envs, env_cfg_override=None: SimpleNamespace(),
+            num_envs=1,
+            replay_buffer=SimpleNamespace(),
+            inference_slot=ring,
+            inference_request_queue=queue.Queue(),
+            inference_response_queue=queue.Queue(),
+            algo_type="sac",
+            actor_adapter_modules=None,
+            metrics_queue=queue.Queue(),
+            inference_transport="cpu",
+            sim_backend="mujoco",
+            backend_device=None,
+            env_cfg_override={"inference_transport": "gpu"},
+            seed=None,
+            trace_enabled=False,
+            trace_thread_time=False,
+        )
+
+
+def test_collector_rejects_cuda_transport_with_cpu_ring() -> None:
+    stop_event = threading.Event()
+    ring = SharedInferenceRing(1, 2, 2, device="cpu")
+
+    with pytest.raises(ValueError, match="ring and env public device differ"):
+        worker_module._run_collector(
+            stop_event=stop_event,
+            env_factory=lambda num_envs, env_cfg_override=None: SimpleNamespace(),
+            num_envs=1,
+            replay_buffer=SimpleNamespace(),
+            inference_slot=ring,
+            inference_request_queue=queue.Queue(),
+            inference_response_queue=queue.Queue(),
+            algo_type="sac",
+            actor_adapter_modules=None,
+            metrics_queue=queue.Queue(),
+            sim_backend="mujoco",
+            backend_device=None,
+            env_cfg_override={"tensor_runtime": True, "tensor_runtime_device": "cuda:0"},
+            inference_transport="cuda",
+            seed=None,
+            trace_enabled=False,
+            trace_thread_time=False,
+        )
+
+
+def test_explicit_cpu_transport_rejects_cuda_tensor_observations() -> None:
+    stop_event = threading.Event()
+
+    class _State:
+        obs = {"obs": torch.zeros((1, 2), device="cuda")}
+        info = {}
+
+    class _Env:
+        state = _State()
+
+    ring = SharedInferenceRing(1, 2, 2, device="cpu")
+
+    with pytest.raises(
+        ValueError, match="CPU inference transport received CUDA tensor observations"
+    ):
+        worker_module._run_collector(
+            stop_event=stop_event,
+            env_factory=lambda num_envs, env_cfg_override=None: _Env(),
+            num_envs=1,
+            replay_buffer=SimpleNamespace(
+                trace_recorder=None,
+                trace_thread_time=False,
+                attach_stop_event=lambda stop: None,
+            ),
+            inference_slot=ring,
+            inference_request_queue=queue.Queue(),
+            inference_response_queue=queue.Queue(),
+            algo_type="sac",
+            actor_adapter_modules=None,
+            metrics_queue=queue.Queue(),
+            inference_transport="cpu",
+            sim_backend="mujoco",
+            backend_device=None,
+            env_cfg_override={},
+            seed=None,
+            trace_enabled=False,
+            trace_thread_time=False,
+        )

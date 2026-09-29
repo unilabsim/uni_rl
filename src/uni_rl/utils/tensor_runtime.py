@@ -1,8 +1,9 @@
-"""Shared resolution for task-owner tensor-native collection."""
+"""Shared resolution for the explicit off-policy inference transport contract."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -163,26 +164,185 @@ class TensorRuntimeSettings:
         }
 
 
+class InferenceTransport(str, Enum):
+    """The two ring/scratch topologies the runtime promises to implement."""
+
+    CUDA = "cuda"
+    CPU = "cpu"
+
+
+@dataclass(frozen=True)
+class InferencePlacement:
+    """Resolved collector/ring/env/learner placement before spawn."""
+
+    mode: InferenceTransport
+    env_device: str
+    ring_device: str
+    learner_device: str
+    collector_tensor_native: bool
+    staging_policy: str
+
+    def manifest(self) -> dict[str, str]:
+        return {
+            "mode": self.mode.value,
+            "env_device": self.env_device,
+            "ring_device": self.ring_device,
+            "learner_device": self.learner_device,
+            "staging_policy": self.staging_policy,
+        }
+
+
+def _canonical_device(value: str, *, label: str, algo_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise TypeError(f"{algo_name} {label} must be a non-empty string, got {value!r}")
+    try:
+        device = torch.device(value)
+    except (RuntimeError, TypeError) as exc:
+        raise ValueError(f"{algo_name} {label} is not a Torch device: {value!r}") from exc
+    if device.type == "cuda" and device.index is None:
+        return "cuda"
+    return str(device)
+
+
+def _device_requires_cuda(device: str) -> bool:
+    return str(torch.device(device).type) == "cuda"
+
+
+def resolve_inference_placement(
+    *,
+    learner_device: str,
+    transport: str | None = None,
+    tensor_runtime: bool = False,
+    tensor_runtime_device: str | None = None,
+    algo_name: str,
+) -> InferencePlacement:
+    """Resolve one explicit topology and reject mixed placement before spawn.
+
+    ``transport`` is authoritative when supplied. ``tensor_runtime`` is the
+    legacy Manager request for CUDA public tensors; combining it with CPU
+    transport is incoherent and fails closed. The explicit
+    ``tensor_runtime_device`` and legacy implicit ``learner_device`` requests
+    must also agree when both are present.
+    """
+    learner = _canonical_device(learner_device, label="learner device", algo_name=algo_name)
+    if tensor_runtime_device is not None and not isinstance(tensor_runtime_device, str):
+        raise TypeError(
+            f"{algo_name} env.tensor_runtime_device must be a string or omitted, "
+            f"got {tensor_runtime_device!r}"
+        )
+    requested_env_device = tensor_runtime_device
+    if tensor_runtime and requested_env_device is None:
+        requested_env_device = learner
+    elif tensor_runtime_device is not None:
+        tensor_runtime = True
+    if transport == InferenceTransport.CUDA.value and requested_env_device is None:
+        requested_env_device = learner
+    if requested_env_device is None:
+        requested_env_device = "cpu"
+    env_resolved = _canonical_device(requested_env_device, label="env device", algo_name=algo_name)
+
+    if tensor_runtime and transport is None:
+        transport = InferenceTransport.CUDA.value
+    elif transport is None:
+        transport = InferenceTransport.CPU.value
+    if not isinstance(transport, str):
+        raise TypeError(f"{algo_name} inference transport must be a string, got {transport!r}")
+    transport = transport.strip().lower()
+    if transport not in {item.value for item in InferenceTransport}:
+        raise ValueError(
+            f"{algo_name} inference transport must be one of {{'cuda', 'cpu'}}, got {transport!r}"
+        )
+
+    if tensor_runtime and transport == InferenceTransport.CPU.value:
+        raise ValueError(
+            f"{algo_name} requests CUDA env.tensor_runtime with CPU inference transport"
+        )
+
+    if transport == InferenceTransport.CUDA.value:
+        if not _device_requires_cuda(learner) or not _device_requires_cuda(env_resolved):
+            raise ValueError(
+                f"{algo_name} CUDA inference transport requires CUDA env and learner "
+                f"devices; got env={env_resolved!r}, learner={learner!r}"
+            )
+        if learner != env_resolved:
+            raise ValueError(
+                f"{algo_name} CUDA inference transport requires rank-local devices to "
+                f"match; got env={env_resolved!r}, learner={learner!r}"
+            )
+        return InferencePlacement(
+            mode=InferenceTransport.CUDA,
+            env_device=env_resolved,
+            ring_device=learner,
+            learner_device=learner,
+            collector_tensor_native=True,
+            staging_policy="cuda_no_host_boundary",
+        )
+
+    if _device_requires_cuda(env_resolved):
+        raise ValueError(
+            f"{algo_name} CPU inference transport requires a CPU env device, "
+            f"got env={env_resolved!r}"
+        )
+    return InferencePlacement(
+        mode=InferenceTransport.CPU,
+        env_device=env_resolved,
+        ring_device="cpu",
+        learner_device=learner,
+        collector_tensor_native=False,
+        staging_policy=(
+            "cpu_ring_explicit_learner_actor_h2d_action_d2h"
+            if _device_requires_cuda(learner)
+            else "cpu_no_device_transfer"
+        ),
+    )
+
+
 def resolve_collector_tensor_native(
     cfg: DictConfig,
     *,
     device: str,
     algo_name: str,
 ) -> bool:
-    """Resolve a task owner's explicit tensor capability before spawning."""
-    value = OmegaConf.select(cfg, "env.tensor_runtime", default=False)
-    if value is None:
-        value = False
-    if type(value) is not bool:
+    """Compatibility resolver returning one placement contract's tensor mode."""
+    return resolve_inference_transport(
+        cfg, device=device, algo_name=algo_name
+    ).collector_tensor_native
+
+
+def resolve_inference_transport(
+    cfg: DictConfig,
+    *,
+    device: str,
+    algo_name: str,
+) -> InferencePlacement:
+    """Resolve placement from the owner config's single config-source tree."""
+    requested_transport = OmegaConf.select(cfg, "training.inference_transport", default=None)
+    env_device = OmegaConf.select(cfg, "env.tensor_runtime_device", default=None)
+    tensor_runtime = OmegaConf.select(cfg, "env.tensor_runtime", default=False)
+    if tensor_runtime is None:
+        tensor_runtime = False
+    if type(tensor_runtime) is not bool:
         raise TypeError(
-            f"{algo_name} env.tensor_runtime must be a boolean or omitted, got {value!r}"
+            f"{algo_name} env.tensor_runtime must be a boolean or omitted, got {tensor_runtime!r}"
         )
-    if value and torch.device(device).type != "cuda":
-        raise ValueError(
-            f"{algo_name} env.tensor_runtime=true requires CUDA, "
-            f"but the replay device is {device!r}"
+    if requested_transport is not None and not isinstance(requested_transport, str):
+        raise TypeError(
+            f"{algo_name} training.inference_transport must be a string or omitted, "
+            f"got {requested_transport!r}"
         )
-    return value
+    if tensor_runtime and env_device is None:
+        env_device = device
+    if tensor_runtime and env_device is not None and not isinstance(env_device, str):
+        raise TypeError(
+            f"{algo_name} env.tensor_runtime_device must be a string or omitted, got {env_device!r}"
+        )
+    return resolve_inference_placement(
+        learner_device=device,
+        transport=requested_transport,
+        tensor_runtime=tensor_runtime,
+        tensor_runtime_device=env_device,
+        algo_name=algo_name,
+    )
 
 
 def _resolve_positive_training_int(
