@@ -635,6 +635,7 @@ def test_tensor_collector_reports_bounded_inference_scheduling_diagnostics(
     assert manifest["inference_dependency_graph"]["transition_to_next_observation"] == (
         "env.step(action[t]) -> observation[t+1]"
     )
+    assert manifest["role_scheduling_evidence"]["role"] == "collector"
 
     report_message = metrics_queue.get_nowait()
     report = report_message["collector_inference"]

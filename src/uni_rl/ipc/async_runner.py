@@ -57,6 +57,7 @@ class AsyncRunner(ABC):
         collector_device: str | None = None,
         sim_backend: str = "mujoco",
         num_envs: int = 4096,
+        collector_scheduling_policy: Any = None,
     ):
         self.env_name = env_name
         self.env_cfg_overrides = env_cfg_overrides
@@ -65,6 +66,7 @@ class AsyncRunner(ABC):
         self.collector_device = collector_device or self.device
         self.sim_backend = sim_backend
         self.num_envs = num_envs
+        self.collector_scheduling_policy = collector_scheduling_policy
 
         self._collector_process: Any = None
         self._stop_event = _SPAWN_CTX.Event()

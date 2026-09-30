@@ -34,6 +34,7 @@ from uni_rl.offpolicy.runner import (
     replay_buffer_ready_for_learning,
     update_reward_stats_from_replay,
 )
+from uni_rl.offpolicy.scheduling import RoleSchedulingPolicy
 from uni_rl.utils.tensor_runtime import (
     InferencePlacement,
     InferenceTransport,
@@ -587,6 +588,7 @@ def test_mjwarp_collector_start_forwards_learner_device(
     assert collector_kwargs["backend_device"] == "cuda:3"
     assert collector_kwargs["learner_pid"] > 0
     assert collector_kwargs["learner_coordination"] is runner._learner_coordination
+    assert collector_kwargs["scheduling_policy"] is runner.role_scheduling_settings.collector
 
 
 def test_normal_completion_quiesces_collector_before_replay_close(
@@ -1173,6 +1175,7 @@ def test_runner_constructs_only_bounded_device_replay(
         "base_seed": 0,
         "trace_recorder": None,
         "trace_cuda_events": True,
+        "scheduling_policy": RoleSchedulingPolicy(),
     }
     runtime_manifest = runner.last_run_summary["runtime_manifest"]
     assert runtime_manifest["replay_h2d_submitter"] == runner.replay_h2d_submitter

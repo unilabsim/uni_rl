@@ -16,6 +16,7 @@ from uni_rl.offpolicy.coordination import (
     LearnerPhase,
     learner_pid_is_alive,
 )
+from uni_rl.offpolicy.scheduling import RoleSchedulingPolicy, apply_role_scheduling_policy
 from uni_rl.offpolicy.tensor_metrics import TensorCollectorMetrics, TensorMetricFlush
 from uni_rl.offpolicy.thread_budget import apply_torch_thread_runtime
 from uni_rl.utils.device import configure_backend_process_device
@@ -249,6 +250,7 @@ def off_policy_collector_fn(
     backend_device_binder=None,
     learner_coordination: LearnerCoordinationState | None = None,
     learner_pid: int | None = None,
+    scheduling_policy: RoleSchedulingPolicy | None = None,
 ):
     """Entry point for the off-policy collector subprocess.
 
@@ -280,6 +282,7 @@ def off_policy_collector_fn(
         backend_device_binder=backend_device_binder,
         learner_coordination=learner_coordination,
         learner_pid=learner_pid,
+        scheduling_policy=scheduling_policy,
     )
 
 
@@ -308,11 +311,16 @@ def _run_collector(
     backend_device_binder=None,
     learner_coordination=None,
     learner_pid=None,
+    scheduling_policy=None,
 ):
     # Spawn subprocesses do not inherit the parent's adapter registrations;
     # import the configured modules so registration side effects run here too.
     import_actor_adapter_modules(actor_adapter_modules)
     apply_torch_thread_runtime(torch_thread_runtime, role="collector", torch_module=torch)
+    collector_scheduling_evidence = apply_role_scheduling_policy(
+        scheduling_policy or RoleSchedulingPolicy(),
+        role="collector",
+    )
     configured_backend_device = configure_backend_process_device(
         sim_backend, backend_device, bind_device=backend_device_binder
     )
@@ -602,6 +610,7 @@ def _run_collector(
         "inference_scheduling_policy": INFERENCE_SCHEDULING_POLICY,
         "inference_legal_max_in_flight": 1,
         "inference_dependency_graph": dict(INFERENCE_DEPENDENCY_GRAPH),
+        "role_scheduling_evidence": collector_scheduling_evidence,
     }
     if trace_recorder:
         manifest_ns = _time.perf_counter_ns()

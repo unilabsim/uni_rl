@@ -13,6 +13,7 @@ from uni_rl.env_contract import EnvFactory
 from uni_rl.offpolicy.actor_adapter import import_actor_adapter_modules
 from uni_rl.offpolicy.double_buffer_runner import DoubleBufferOffPolicyRunner
 from uni_rl.offpolicy.runtime import resolve_actor_adapter_modules, resolve_custom_offpolicy_runtime
+from uni_rl.offpolicy.scheduling import RoleSchedulingSettings
 from uni_rl.utils.nan_guard import NanGuardCfg
 from uni_rl.utils.observations import get_obs_dims
 from uni_rl.utils.tensor_runtime import (
@@ -37,6 +38,7 @@ def build_sac_double_buffer_runner(
     collector_cpu_ids: list[int] | None = None,
     dp_sync: DpParameterSync | None = None,
     backend_device_binder: Callable[[str], str | None] | None = None,
+    role_scheduling_settings: RoleSchedulingSettings | None = None,
 ) -> Any:
     """Build SAC from its Hydra owner config without interpreting it in the entrypoint."""
     rl_cfg = cast(dict[str, Any], OmegaConf.to_container(cfg.algo, resolve=True))
@@ -143,5 +145,6 @@ def build_sac_double_buffer_runner(
         actor_adapter_modules=actor_adapter_modules,
         inference_placement=inference_placement,
         tensor_runtime_settings=tensor_runtime_settings,
+        role_scheduling_settings=role_scheduling_settings,
         log_interval=int(cfg.training.log_interval),
     )

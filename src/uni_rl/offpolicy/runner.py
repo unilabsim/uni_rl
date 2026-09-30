@@ -11,6 +11,7 @@ from uni_rl.ipc.async_runner import AsyncRunner
 from uni_rl.logging import OffPolicyLogger
 from uni_rl.logging.metrics_drain import RewardComponentWindow, drain_collector_metrics
 from uni_rl.offpolicy.actor_adapter import import_actor_adapter_modules
+from uni_rl.offpolicy.scheduling import RoleSchedulingSettings
 from uni_rl.utils.device import get_default_device
 from uni_rl.utils.nan_guard import NanGuardCfg
 from uni_rl.utils.seed import apply_training_seed
@@ -121,6 +122,7 @@ class OffPolicyRunner(AsyncRunner):
         trace_cuda_events: bool = True,
         nan_guard_cfg: NanGuardCfg | None = None,
         torch_thread_runtime: dict[str, Any] | None = None,
+        role_scheduling_settings: RoleSchedulingSettings | None = None,
         actor_adapter_modules: Iterable[str] | None = None,
         log_interval: int = 1,
     ):
@@ -134,6 +136,9 @@ class OffPolicyRunner(AsyncRunner):
             collector_device="cpu",
             num_envs=num_envs,
             sim_backend=sim_backend,
+            collector_scheduling_policy=(
+                role_scheduling_settings.collector if role_scheduling_settings is not None else None
+            ),
         )
 
         self.learner = learner
@@ -160,6 +165,7 @@ class OffPolicyRunner(AsyncRunner):
         self.trace_cuda_events = trace_cuda_events
         self.nan_guard_cfg = nan_guard_cfg
         self.torch_thread_runtime = torch_thread_runtime
+        self.role_scheduling_settings = role_scheduling_settings or RoleSchedulingSettings()
         self.log_interval = max(1, int(log_interval))
         # Dotted modules whose import registers custom off-policy actor
         # adapters. Imported here (learner process) and forwarded to the

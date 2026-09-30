@@ -12,6 +12,7 @@ from uni_rl.algos.flash_sac.learner import FlashSACLearner
 from uni_rl.env_contract import EnvFactory
 from uni_rl.ipc.replay_pipelines.gpu_resident import require_offpolicy_replay_device
 from uni_rl.offpolicy.double_buffer_runner import DoubleBufferOffPolicyRunner
+from uni_rl.offpolicy.scheduling import RoleSchedulingSettings
 from uni_rl.utils.device import get_default_device
 from uni_rl.utils.nan_guard import NanGuardCfg
 from uni_rl.utils.observations import get_obs_dims
@@ -49,6 +50,7 @@ def build_flashsac_double_buffer_runner(
     collector_cpu_ids: list[int] | None = None,
     dp_sync: DpParameterSync | None = None,
     backend_device_binder: Callable[[str], str | None] | None = None,
+    role_scheduling_settings: RoleSchedulingSettings | None = None,
 ) -> Any:
     """Build FlashSAC with the bounded-ingress device replay pipeline."""
     device = require_offpolicy_replay_device(device or get_default_device())
@@ -148,5 +150,6 @@ def build_flashsac_double_buffer_runner(
         backend_device_binder=backend_device_binder,
         inference_placement=inference_placement,
         tensor_runtime_settings=tensor_runtime_settings,
+        role_scheduling_settings=role_scheduling_settings,
         log_interval=int(cfg.training.log_interval),
     )

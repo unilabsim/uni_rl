@@ -43,6 +43,7 @@ from uni_rl.offpolicy.runner import (
     build_offpolicy_sample_info,
     replay_buffer_ready_for_learning,
 )
+from uni_rl.offpolicy.scheduling import RoleSchedulingSettings, apply_role_scheduling_policy
 from uni_rl.offpolicy.shutdown_diagnostics import ShutdownDiagnosticsRecorder
 from uni_rl.offpolicy.thread_budget import (
     format_torch_thread_runtime,
@@ -187,6 +188,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         learner_prepare_hook: Callable[[Any, OffPolicyWarmupContext], None] | None = None,
         backend_device_binder: Callable[[str], str | None] | None = None,
         replay_pipeline_factory: Callable[..., GPUResidentReplayPipeline] | None = None,
+        role_scheduling_settings: RoleSchedulingSettings | None = None,
         target_frequency: int = 1,
         policy_before_critic: bool = False,
         inference_placement: InferencePlacement | None = None,
@@ -289,6 +291,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         # Per-rank CPU block owned by this rank's collector (multi-GPU DP);
         # merged into the collector-only env override at collector startup.
         self.collector_cpu_ids = list(collector_cpu_ids) if collector_cpu_ids is not None else None
+        self.role_scheduling_settings = role_scheduling_settings or RoleSchedulingSettings()
+        self.learner_scheduling_evidence: dict[str, object] | None = None
         self.collector_backend_device = collector_backend_device
         if isinstance(collector_tensor_native, bool) and inference_placement is None:
             inference_placement = InferencePlacement(
@@ -391,6 +395,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "inference_staging_policy": self.inference_placement.staging_policy,
             "inference_ring_capacity": self.inference_slot_capacity,
             "runtime_limits": self.tensor_runtime_settings.manifest(),
+            "role_scheduling": self.role_scheduling_settings.manifest(),
             "inference_flight": {
                 "queue_depth": 0,
                 "publication_lag": 0,
@@ -1480,6 +1485,10 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         # --- authoritative device ring and hot/cold learner batches ---
         sample_count = self.tensor_runtime_settings.learner_sample_count
         replay_pipeline_factory = self.replay_pipeline_factory or GPUResidentReplayPipeline
+        self.learner_scheduling_evidence = apply_role_scheduling_policy(
+            self.role_scheduling_settings.learner,
+            role="learner",
+        )
         replay_pipeline = replay_pipeline_factory(
             replay_buffer,
             device=self.device,
@@ -1487,6 +1496,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             base_seed=int(self.seed or 0),
             trace_recorder=trace_recorder,
             trace_cuda_events=self.trace_cuda_events,
+            scheduling_policy=self.role_scheduling_settings.buffer,
         )
         self._shared_resources.insert(0, replay_pipeline)
         self.replay_h2d_submitter = getattr(
@@ -1510,11 +1520,17 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 "replay_device_submission_thread": self.replay_transfer_backend.get(
                     "device_submission_thread"
                 ),
+                "buffer_scheduling_evidence": getattr(
+                    replay_pipeline,
+                    "scheduling_evidence",
+                    None,
+                ),
                 "replay_ingress": (
                     ingress_diagnostics_method() if callable(ingress_diagnostics_method) else {}
                 ),
             }
         )
+        self.runtime_manifest["learner_scheduling_evidence"] = self.learner_scheduling_evidence
 
         self._shutdown_recorder.set_phase(owner="learner", phase="startup/inference_resources")
         inference_slot = SharedInferenceRing(
@@ -1617,6 +1633,12 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         logger.log_status(f"Inference owner: learner.actor ({self.device})")
         if self.collector_backend_device is not None:
             logger.log_status(f"Collector backend device: {self.collector_backend_device}")
+        logger.log_status(
+            "Role scheduling: "
+            f"learner={self.role_scheduling_settings.learner}, "
+            f"buffer={self.role_scheduling_settings.buffer}, "
+            f"collector={self.role_scheduling_settings.collector}"
+        )
         logger.log_status("Collector actor/inference ownership: none")
         logger.log_status(
             f"Replay learner lightweight: batched event write (log_interval={self.log_interval})"
@@ -1672,6 +1694,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 "backend_device_binder": self.backend_device_binder,
                 "learner_coordination": self._learner_coordination,
                 "learner_pid": os.getpid(),
+                "scheduling_policy": self.role_scheduling_settings.collector,
             }
             # The collector may finish env construction quickly while the
             # learner is still in its startup sleep. It must observe a healthy

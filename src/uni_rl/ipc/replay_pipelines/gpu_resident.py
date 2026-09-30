@@ -28,6 +28,7 @@ import torch
 from uni_rl.ipc.replay_buffer import ReplayBuffer
 from uni_rl.ipc.replay_pipelines.base import ReplayTickMetadata
 from uni_rl.ipc.replay_pipelines.transfer import build_replay_transfer_backend
+from uni_rl.offpolicy.scheduling import RoleSchedulingPolicy, apply_role_scheduling_policy
 
 
 def require_offpolicy_replay_device(device: str | None) -> str:
@@ -120,6 +121,7 @@ class GPUResidentReplayPipeline:
         base_seed: int = 0,
         trace_recorder=None,
         trace_cuda_events: bool = True,
+        scheduling_policy: RoleSchedulingPolicy | None = None,
     ) -> None:
         self._replay_buffer = replay_buffer
         self._device = torch.device(require_offpolicy_replay_device(device))
@@ -215,13 +217,24 @@ class GPUResidentReplayPipeline:
         self._prepare_condition = threading.Condition()
         self._closed = False
         self._sync_thread: threading.Thread | None = None
+        self.scheduling_evidence: dict[str, object] | None = None
         if not self._main_thread_submission:
+            scheduling_evidence = apply_role_scheduling_policy(
+                scheduling_policy or RoleSchedulingPolicy(),
+                role="buffer",
+            )
             self._sync_thread = threading.Thread(
                 target=self._sync_worker,
                 name="replay_gpu_resident_sync",
                 daemon=True,
             )
+            self.scheduling_evidence = scheduling_evidence
             self._sync_thread.start()
+        else:
+            self.scheduling_evidence = apply_role_scheduling_policy(
+                RoleSchedulingPolicy(),
+                role="buffer",
+            )
 
     @property
     def h2d_submitter(self) -> str:
