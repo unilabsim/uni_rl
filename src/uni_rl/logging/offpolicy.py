@@ -105,7 +105,9 @@ _COLLECTOR_TIMING_SPECS = {
     "env_step_backend_ms": (2.1, "  Backend Step", "env_step_detail"),
     "env_step_update_state_ms": (2.2, "  Update State", "env_step_detail"),
     "env_step_reset_done_ms": (2.3, "  Reset Done", "env_step_detail"),
+    "transition_extract_ms": (2.4, "Transition Extract", "cycle_phase"),
     "replay_write_ms": (3.0, "Replay Write", "cycle_phase"),
+    "metrics_publish_ms": (4.0, "Metrics Publish", "cycle_phase"),
     "rollout_ms": (9.0, "Rollout Wall", "rollout_total"),
 }
 

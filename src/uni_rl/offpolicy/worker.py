@@ -31,7 +31,9 @@ COLLECTOR_TIMING_KEYS = (
     "inference_request_ms",
     "learner_action_wait_ms",
     "env_step_ms",
+    "transition_extract_ms",
     "replay_write_ms",
+    "metrics_publish_ms",
 )
 COLLECTOR_READY_TICK = -1
 INFERENCE_SCHEDULING_POLICY = "sequential_transition_dependency"
@@ -838,11 +840,12 @@ def _run_collector(
                 assert combined_dones is not None
                 assert truncated_np is not None
                 assert terminal_contract is not None
-            phase_start_ns = _record_phase_ms(cycle_timing_ms, "replay_write_ms", phase_start_ns)
-
             # ReplayBuffer `dones` follows the UniLab env lifecycle contract:
             # done = terminated | truncated. Learners use `truncated` to keep
             # bootstrap enabled for timeout/truncation rows.
+            phase_start_ns = _record_phase_ms(
+                cycle_timing_ms, "transition_extract_ms", phase_start_ns
+            )
             _rb_ns = _time.perf_counter_ns()
             if tensor_collector:
                 assert obs_t is not None
@@ -941,6 +944,8 @@ def _run_collector(
                 for k, v in log_info.items():
                     if k.startswith("reward/"):
                         ep_reward_components[k.removeprefix("reward/")].append(v)
+
+            phase_start_ns = _record_phase_ms(cycle_timing_ms, "metrics_publish_ms", phase_start_ns)
 
             # Send metrics every collector cycle so learner-side reward and
             # throughput displays track the current policy without extra lag.

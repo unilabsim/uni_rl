@@ -499,8 +499,16 @@ METRIC_SPECS: dict[str, MetricSpec] = {
             "Process resets and done observations.",
         ),
         _collector_ms(
+            "Perf/collector_transition_extract_ms",
+            "Extract one transition from the environment state without crossing the replay boundary.",
+        ),
+        _collector_ms(
             "Perf/collector_replay_write_ms",
             "Write transitions to replay storage.",
+        ),
+        _collector_ms(
+            "Perf/collector_metrics_publish_ms",
+            "Update and publish collector episode metrics.",
         ),
     )
 }
