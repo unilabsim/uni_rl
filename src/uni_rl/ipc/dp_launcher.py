@@ -62,6 +62,76 @@ def current_dp_rank() -> int:
     return int(os.environ.get(UNILAB_DP_RANK, "0"))
 
 
+def visible_cuda_entries(current_visible_devices: str | None = None) -> tuple[str, ...]:
+    """Return the process-local CUDA visibility entries without touching Torch.
+
+    Entries are opaque: they may be physical indices or CUDA UUID/MIG tokens.
+    An unset variable means the host namespace; an empty value (or ``-1``)
+    means CUDA is deliberately hidden.  This parser is cold-path only and is
+    intentionally usable before the first CUDA query.
+    """
+    raw = (
+        os.environ.get("CUDA_VISIBLE_DEVICES")
+        if current_visible_devices is None
+        else current_visible_devices
+    )
+    if raw is None:
+        return ()
+    entries = tuple(entry.strip() for entry in raw.split(",") if entry.strip())
+    if entries == ("-1",):
+        return ()
+    return entries
+
+
+def rank_local_cuda_device(
+    *,
+    rank: int = 0,
+    current_visible_devices: str | None = None,
+) -> str | None:
+    """Resolve ``cuda:0`` when this rank owns exactly one visible GPU.
+
+    ``CUDA_VISIBLE_DEVICES`` is the authoritative rank-local namespace.  A
+    single entry can come either from an ordinary user launch or from
+    :class:`DpRankSupervisor`; in both cases every in-process consumer must use
+    the local index zero rather than a host-global index.
+    """
+    entries = visible_cuda_entries(current_visible_devices)
+    if len(entries) != 1:
+        return None
+    if int(rank) < 0:
+        raise ValueError(f"rank must be non-negative, got {rank}")
+    return "cuda:0"
+
+
+def resolve_dp_rank_device(devices: tuple[int, ...] | None, rank: int) -> str | None:
+    """Return this rank's CUDA device, or None when selection remains automatic.
+
+    A single-entry ``CUDA_VISIBLE_DEVICES`` is the authoritative rank-local
+    namespace.  It wins over ``training.devices`` in an ordinary single-rank
+    launch, while a supervisor child uses that local ``cuda:0`` regardless of
+    the parent indices carried by its inherited Hydra configuration.
+    """
+    local_device = rank_local_cuda_device()
+    if local_device is not None:
+        spawned_rank = int(os.environ.get(UNILAB_DP_WORLD_SIZE, "1")) > 1
+        if not spawned_rank and devices is not None:
+            selected = devices[int(rank)]
+            if selected != 0:
+                raise ValueError(
+                    "A single-entry CUDA_VISIBLE_DEVICES is authoritative; "
+                    f"training.devices={list(devices)} conflicts with rank {rank}'s "
+                    "local cuda:0 namespace"
+                )
+        return local_device
+    if devices is None:
+        return None
+    if rank < 0 or rank >= len(devices):
+        raise ValueError(
+            f"data-parallel rank {rank} is out of range for training.devices={list(devices)}"
+        )
+    return f"cuda:{devices[rank]}"
+
+
 def current_dp_world_size() -> int:
     """Data-parallel world size of this process (1 when not spawned as a rank)."""
     return int(os.environ.get(UNILAB_DP_WORLD_SIZE, "1"))
@@ -310,24 +380,13 @@ def launch_torchrun_workers(
         raise RuntimeError(f"torchrun workers failed with exit code {completed.returncode}")
 
 
-def resolve_dp_rank_device(devices: tuple[int, ...] | None, rank: int) -> str | None:
-    """Return ``cuda:<index>`` for one configured rank, or None for auto selection."""
-    if devices is None:
-        return None
-    if rank < 0 or rank >= len(devices):
-        raise ValueError(
-            f"data-parallel rank {rank} is out of range for training.devices={list(devices)}"
-        )
-    return f"cuda:{devices[rank]}"
-
-
 def apply_dp_rank_config(cfg: Any, devices: tuple[int, ...] | None, rank: int) -> str | None:
     """Apply the per-rank seed and return this rank's explicit CUDA device.
 
     Rank 0 keeps the configured seed; rank i>0 trains with ``seed + i`` until
-    init broadcast lands in a later stage. ``training.devices`` is the sole
-    public off-policy device field, so the resolved runtime device is returned
-    instead of being written back into a synthetic ``training.device`` key.
+    init broadcast lands in a later stage. The resolved rank-local device is
+    returned instead of being written back into a synthetic ``training.device``
+    key; with rank-local CUDA visibility this is always ``cuda:0``.
     """
     if devices is None:
         return None
@@ -411,15 +470,25 @@ class DpRankSupervisor:
         if self._world_size <= 1:
             # Single-device degenerate case: nothing to spawn or watch.
             return self
+        selected_visible_devices = resolve_cuda_visible_devices(
+            self._devices,
+            current_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
+        )
         base_env = os.environ | {
             UNILAB_DP_WORLD_SIZE: str(self._world_size),
-            UNILAB_DP_DEVICES: ",".join(str(index) for index in self._devices),
+            UNILAB_DP_DEVICES: selected_visible_devices,
             UNILAB_DP_LOG_DIR: self._log_dir,
+            # One rank owns one GPU.  Rank-local child payloads must be
+            # ``cuda:0`` even when the parent namespace contains UUIDs.
+            "CUDA_VISIBLE_DEVICES": selected_visible_devices,
         }
         self._install_signal_handlers()
         try:
             for rank in range(1, self._world_size):
-                env = base_env | {UNILAB_DP_RANK: str(rank)}
+                env = base_env | {
+                    UNILAB_DP_RANK: str(rank),
+                    "CUDA_VISIBLE_DEVICES": selected_visible_devices.split(",")[rank - 1],
+                }
                 self._children.append(
                     subprocess.Popen(
                         _current_entry_command(),
