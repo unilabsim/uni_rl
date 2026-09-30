@@ -956,6 +956,7 @@ def test_extract_env_step_breakdown_timing_ms_maps_env_owned_keys_only() -> None
                 "step_core_ms": 1.5,
                 "update_state_ms": 2.5,
                 "reset_done_ms": 0.25,
+                "action_validate_ms": 0.1,
                 "apply_action_ms": 9.0,
             }
         }
@@ -965,6 +966,8 @@ def test_extract_env_step_breakdown_timing_ms_maps_env_owned_keys_only() -> None
         "env_step_backend_ms": 1.5,
         "env_step_update_state_ms": 2.5,
         "env_step_reset_done_ms": 0.25,
+        "env_step_action_validate_ms": 0.1,
+        "env_step_apply_action_ms": 9.0,
     }
 
 

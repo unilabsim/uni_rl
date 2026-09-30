@@ -486,6 +486,14 @@ METRIC_SPECS: dict[str, MetricSpec] = {
         ),
         _collector_ms("Perf/collector_env_step_ms", "Environment step wall time."),
         _collector_ms(
+            "Perf/collector_env_step_action_validate_ms",
+            "Validate public policy actions.",
+        ),
+        _collector_ms(
+            "Perf/collector_env_step_apply_action_ms",
+            "Process actions and publish control tensors.",
+        ),
+        _collector_ms(
             "Perf/collector_env_step_action_backend_ms",
             "Apply actions and execute the backend step.",
         ),

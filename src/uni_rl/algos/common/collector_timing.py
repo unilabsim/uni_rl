@@ -7,6 +7,8 @@ from numbers import Real
 from typing import Any
 
 ENV_STEP_BREAKDOWN_TIMING_MAP = {
+    "action_validate_ms": "env_step_action_validate_ms",
+    "apply_action_ms": "env_step_apply_action_ms",
     "action_backend_step_ms": "env_step_action_backend_ms",
     "step_core_ms": "env_step_backend_ms",
     "update_state_ms": "env_step_update_state_ms",
