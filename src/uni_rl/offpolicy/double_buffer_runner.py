@@ -634,6 +634,28 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 process.terminate()
                 process.join(timeout=5.0)
 
+    def _drain_collector_metrics_after_shutdown(
+        self,
+        metrics_queue,
+        reward_history: deque,
+        latest_reward_components: RewardComponentWindow,
+        logger,
+    ) -> None:
+        """Consume the collector's final metric publication after quiesce.
+
+        ``_shutdown_collector`` joins the process before this call. The worker
+        publishes its final partial tensor-metric window from its ``finally``
+        block, so a bounded queue still preserves every message. Draining here
+        is therefore safe even when the process exits between the learner's
+        normal polling points.
+        """
+        self._drain_metrics(
+            metrics_queue,
+            reward_history,
+            latest_reward_components,
+            logger,
+        )
+
     def _collect_dp_sync_metrics(self, iter_metrics: defaultdict[str, list]) -> None:
         """Move per-optimizer collective timing into this iteration's metrics."""
         if self.dp_sync is None:
@@ -2166,6 +2188,25 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             # but quiescing first prevents an unpublished suffix from racing
             # pipeline.close(), which drains and releases every published chunk.
             self._shutdown_collector()
+            self._shutdown_recorder.set_phase(
+                owner="learner",
+                phase="finalize/collector_metrics_drain",
+                iteration=iteration,
+            )
+            self._drain_collector_metrics_after_shutdown(
+                metrics_queue,
+                reward_history,
+                latest_reward_components,
+                logger,
+            )
+            # The final partial episode window is not represented by the last
+            # periodic scalar. Recompute both summary values from the complete
+            # collector history after shutdown so best/final can differ when an
+            # earlier episode window was stronger.
+            if reward_history:
+                last_mean_reward = float(reward_history[-1])
+                best_mean_reward = max(best_mean_reward, last_mean_reward)
+                has_logged_reward = True
             self._shutdown_recorder.set_phase(
                 owner="learner", phase="finalize/replay_pipeline_close", iteration=iteration
             )

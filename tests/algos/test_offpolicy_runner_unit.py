@@ -17,6 +17,7 @@ import uni_rl.offpolicy.runner as runner_module
 from uni_rl.ipc.async_runner import AsyncRunner
 from uni_rl.ipc.inference_ring import SharedInferenceRing
 from uni_rl.logging.metric_schema import METRIC_SCHEMA_VERSION, normalize_metric_map
+from uni_rl.logging.metrics_drain import RewardComponentWindow
 from uni_rl.logging.runtime_manifest_schema import (
     RUNTIME_MANIFEST_SCHEMA_VERSION,
     validate_runtime_manifest,
@@ -346,6 +347,29 @@ class _FakePipeline:
         type(self).close_calls += 1
 
 
+class _ReadyPipeline(_FakePipeline):
+    last_incremental_h2d_time_s = 0.0
+
+    def progress(self, *, wait=False):
+        del wait
+        return True
+
+    def start_prepare(self, tick_id, sample_count, min_snapshot_ptr=None):
+        del tick_id, sample_count, min_snapshot_ptr
+        return True
+
+    def batch_ready(self, tick_id, sample_count):
+        del tick_id, sample_count
+        return True
+
+    def sample_large_batch(self, tick_id, sample_count):
+        del tick_id, sample_count
+        return {}
+
+    def after_tick(self):
+        return None
+
+
 class _FakeLogger:
     last_instance: "_FakeLogger | None" = None
     _total_steps = 0
@@ -401,6 +425,21 @@ class _FakeLogger:
 
     def _get_iter_wall_time(self):
         return 0.0
+
+
+class _RewardSummaryLogger(_FakeLogger):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._mean_ep_length = 0.0
+        self._runtime_manifest = {}
+        self._total_steps = 0
+
+    def update_mean_episode_length(self, length):
+        self._mean_ep_length = float(length)
+
+    def log_collector(self, total_steps, buffer_size):
+        del buffer_size
+        self._total_steps = int(total_steps)
 
 
 def _unused_env_factory(num_envs, env_cfg_override=None):
@@ -558,28 +597,7 @@ def test_normal_completion_quiesces_collector_before_replay_close(
 
     lifecycle: list[str] = []
 
-    class _CloseAfterCollectorQuiescePipeline(_FakePipeline):
-        last_incremental_h2d_time_s = 0.0
-
-        def progress(self, *, wait=False):
-            del wait
-            return True
-
-        def start_prepare(self, tick_id, sample_count, min_snapshot_ptr=None):
-            del tick_id, sample_count, min_snapshot_ptr
-            return True
-
-        def batch_ready(self, tick_id, sample_count):
-            del tick_id, sample_count
-            return True
-
-        def sample_large_batch(self, tick_id, sample_count):
-            del tick_id, sample_count
-            return {}
-
-        def after_tick(self):
-            return None
-
+    class _CloseAfterCollectorQuiescePipeline(_ReadyPipeline):
         def close(self):
             assert runner._collector_quiesced, "replay pipeline closed before collector exit"
             lifecycle.append("replay_close")
@@ -676,6 +694,74 @@ def test_normal_completion_quiesces_collector_before_replay_close(
 
     assert runner.last_run_summary["status"] == "completed"
     assert lifecycle == ["collector_quiesce", "replay_close"]
+
+
+def test_learn_consumes_final_collector_return_metric(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Consume a metric message queued by the collector at process shutdown."""
+
+    _FakePipeline.close_calls = 0
+    _FakeReplayBuffer.diagnostics_calls = 0
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", _FakeReplayBuffer)
+    monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", _FakePipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _RewardSummaryLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        device_runner_module.torch.cuda, "mem_get_info", lambda device: (1 << 30, 2 << 30)
+    )
+
+    class _FakeInferenceRing:
+        nbytes = 1
+
+        def __init__(self, *args, **kwargs):
+            del args
+            self.device = torch.device(kwargs["device"])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(device_runner_module, "SharedInferenceRing", _FakeInferenceRing)
+    real_empty = torch.empty
+
+    def empty_without_cuda(*args, **kwargs):
+        if str(kwargs.get("device", "")).startswith("cuda"):
+            kwargs["device"] = "cpu"
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(device_runner_module.torch, "empty", empty_without_cuda)
+    runner = _make_device_runner(monkeypatch, device="cuda:3", sim_backend="mjwarp")
+    runner.device = "cpu"
+    monkeypatch.setattr(runner, "_prepare_inference_timing_events", lambda: None)
+    monkeypatch.setattr(runner, "_dp_init_broadcast", lambda: None)
+    monkeypatch.setattr(runner, "_prepare_learner", lambda **kwargs: None)
+    monkeypatch.setattr(runner, "_start_collector", lambda *, target_fn, kwargs: None)
+
+    metrics_queue = queue.Queue()
+    metrics_queue.put_nowait(
+        {
+            "total_steps": 8192,
+            "buffer_size": 8192,
+            "return_mean_ep100": 4.0,
+            "mean_episode_length": 32.0,
+            "metric_flush": "final",
+        }
+    )
+    reward_history: deque[float] = deque(maxlen=10)
+    reward_history.append(1.0)
+    logger = _RewardSummaryLogger()
+
+    runner._drain_collector_metrics_after_shutdown(
+        metrics_queue,
+        reward_history,
+        RewardComponentWindow(),
+        logger,
+    )
+
+    assert list(reward_history) == [1.0, 4.0]
+    assert logger._mean_ep_length == pytest.approx(32.0)
+    assert logger._total_steps == 8192
+    assert metrics_queue.empty()
 
 
 def test_learn_failure_before_summary_preserves_original_error(
